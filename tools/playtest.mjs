@@ -1,0 +1,31 @@
+// Smoke-test the real player in a phone-sized viewport: boot, tap start, let it run, pause, seek, change quality, reach the end.
+import { createRequire } from 'node:module';
+const { chromium, devices } = createRequire(import.meta.url)('playwright');
+import { serve } from './still.mjs';
+const out = process.env.SCRATCH || '/tmp';
+const target = process.argv[2] || '/index.html';
+const { srv, url } = await serve();
+const browser = await chromium.launch({ args: ['--autoplay-policy=user-gesture-required'] });
+const ctx = await browser.newContext({ ...devices['iPhone 14'], deviceScaleFactor: 2 });
+const page = await ctx.newPage();
+const errs = []; page.on('pageerror', e => errs.push(e.message)); page.on('console', m => { if (m.type() === 'error' || m.type() === 'warning') errs.push(m.text()); });
+const t0 = Date.now();
+await page.goto(url + target);
+await page.waitForSelector('#frame.ready', { timeout: 60000 });
+console.log('ready in ms', Date.now() - t0, await page.evaluate(() => PLAYER.state()));
+await page.waitForTimeout(1200); await page.screenshot({ path: out + '/play-start.png' });
+await page.click('#start'); await page.waitForTimeout(4000);
+const a = await page.evaluate(() => PLAYER.state()); console.log('after 4s', a);
+await page.evaluate(() => PLAYER.seek(84)); await page.waitForTimeout(1500);
+await page.mouse.move(200, 400); await page.waitForTimeout(300); await page.screenshot({ path: out + '/play-controls.png' });
+console.log('after seek', await page.evaluate(() => PLAYER.state()));
+await page.click('#pp'); await page.waitForTimeout(400); const p1 = await page.evaluate(() => PLAYER.state()); await page.waitForTimeout(600); const p2 = await page.evaluate(() => PLAYER.state());
+console.log('paused holds:', p1.playing === false && Math.abs(p1.t - p2.t) < 1e-6);
+await page.click('#controls .row2 [data-q="2"]'); await page.waitForTimeout(2500); console.log('quality ->', await page.evaluate(() => [PLAYER.state().q, document.getElementById('stage').width]));
+await page.click('#pp'); await page.evaluate(() => PLAYER.seek(148.2)); await page.waitForTimeout(3200);
+console.log('at end', await page.evaluate(() => PLAYER.state())); await page.screenshot({ path: out + '/play-end.png' });
+await page.click('#replay'); await page.waitForTimeout(1500); console.log('replayed', await page.evaluate(() => PLAYER.state()));
+// frame pacing while playing at the chosen quality
+const fps = await page.evaluate(() => new Promise(r => { PLAYER.seek(125); let n = 0, t = performance.now(); (function f() { n++; if (performance.now() - t < 3000) requestAnimationFrame(f); else r(n / 3); })(); }));
+console.log('fps', fps.toFixed(1), 'errors:', errs);
+await browser.close(); srv.close();
