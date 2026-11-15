@@ -1,0 +1,487 @@
+/* score.js — 《江月何年》原创配乐：全部由算术合成（无采样、无录音）。
+   一条五声“月”主题（商 角 徵— 羽— 徵 角 | 商— 宫 商 | 羽——）贯穿九段，随时辰更换乐器。
+   Pure JS DSP (no samples, no recordings): runs in Node (tools/audio.mjs) and renders 48 kHz stereo stems. */
+(function (root) {
+  'use strict';
+  var SR = 48000, DUR = 180, N = SR * DUR, TAU = Math.PI * 2;
+  var seed = 20261113;
+  function rnd() { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return ((seed >>> 0) / 4294967296); }
+  function nz() { return rnd() * 2 - 1; }
+  var NOTE = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+  function m(n) { var mt = /^([A-G])([#b]?)(-?\d)$/.exec(n); return 12 * (parseInt(mt[3], 10) + 1) + NOTE[mt[1]] + (mt[2] === '#' ? 1 : mt[2] === 'b' ? -1 : 0); }
+  function hz(mid) { return 440 * Math.pow(2, (mid - 69) / 12); }
+  function f(n) { return hz(typeof n === 'string' ? m(n) : n); }
+  function db(x) { return Math.pow(10, x / 20); }
+  function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
+
+  /* ---------------- stems ---------------- */
+  function Stem() { this.L = new Float32Array(N); this.R = new Float32Array(N); this.hall = new Float32Array(N); this.cath = new Float32Array(N); }
+  /** mix mono buffer at time t. o:{g, pan(-1..1), hall, cath} */
+  Stem.prototype.add = function (buf, t, o) {
+    var i0 = Math.round(t * SR), g = o.g === undefined ? 1 : o.g, pan = o.pan || 0, a = (pan + 1) * Math.PI / 4, gl = Math.cos(a) * g, gr = Math.sin(a) * g, h = (o.hall || 0) * g, c = (o.cath || 0) * g;
+    var L = this.L, R = this.R, H = this.hall, Cc = this.cath, n = buf.length;
+    for (var i = 0; i < n; i++) { var j = i0 + i; if (j < 0) continue; if (j >= N) break; var s = buf[i]; L[j] += s * gl; R[j] += s * gr; if (h) H[j] += s * h; if (c) Cc[j] += s * c; }
+  };
+
+  /* ---------------- instruments ---------------- */
+  /** Karplus–Strong string (koto / harp). o:{t60, bright(0..1), damp(0..0.5), pos(0..1)} */
+  function pluck(freq, dur, o) {
+    var n = Math.round(dur * SR), out = new Float32Array(n), damp = o.damp === undefined ? .3 : o.damp, D = SR / freq - damp, M = Math.ceil(D) + 4, d = new Float32Array(M);
+    var Li = Math.round(SR / freq), ex = new Float32Array(Li), lp = 0, i, pk = 0, br = o.bright === undefined ? .5 : o.bright;
+    for (i = 0; i < Li; i++) { lp += br * (nz() - lp); ex[i] = lp; }
+    var pp = Math.max(1, Math.round(Li * (o.pos || .22)));
+    for (i = 0; i < Li; i++) { var v = ex[i] - ex[(i + pp) % Li] * .85; d[i] = v; if (Math.abs(v) > pk) pk = Math.abs(v); }
+    for (i = 0; i < Li; i++) d[i] /= pk || 1;
+    var gLoop = Math.pow(10, -3 * (1 / freq) / (o.t60 || 3)), w = Li, prev = 0, body = 0, bc = o.body || .55;
+    for (i = 0; i < n; i++) {
+      var rp = w - D; while (rp < 0) rp += M; var i0 = Math.floor(rp), fr = rp - i0, a = d[i0 % M], b = d[(i0 + 1) % M], y = a + fr * (b - a);
+      var y2 = gLoop * ((1 - damp) * y + damp * prev); prev = y; d[w % M] = y2; w = (w + 1) % M;
+      body += bc * (y - body); out[i] = body;
+    }
+    var rel = Math.min(n, Math.round(.08 * SR)); for (i = 0; i < rel; i++) out[n - 1 - i] *= i / rel;
+    return out;
+  }
+  /** additive tone with exponentially decaying partials. parts: [ratio, amp, tau] */
+  function additive(freq, dur, parts, att) {
+    var n = Math.round(dur * SR), out = new Float32Array(n), i, k;
+    for (k = 0; k < parts.length; k++) {
+      var fr = freq * parts[k][0]; if (fr > 18000) continue;
+      var w = TAU * fr / SR, c = 2 * Math.cos(w), ph = rnd() * TAU, y1 = Math.sin(ph - w), y2 = Math.sin(ph - 2 * w), e = parts[k][1], dk = Math.exp(-1 / (parts[k][2] * SR));
+      for (i = 0; i < n; i++) { var y = c * y1 - y2; y2 = y1; y1 = y; out[i] += y * e; e *= dk; }
+    }
+    var a = Math.round((att || .004) * SR); for (i = 0; i < a && i < n; i++) out[i] *= .5 - .5 * Math.cos(Math.PI * i / a);
+    var rel = Math.min(n, Math.round(.12 * SR)); for (i = 0; i < rel; i++) out[n - 1 - i] *= i / rel;
+    return out;
+  }
+  function piano(freq, dur, vel) { // soft felt piano
+    var parts = [], B = .00035, t0 = clamp(5.2 * Math.pow(220 / freq, .55), .7, 7), v = vel === undefined ? .7 : vel;
+    for (var k = 1; k <= 14; k++) { var a = Math.pow(k, -1.75 - (1 - v) * .9) * (k === 1 ? 1 : .9); parts.push([k * Math.sqrt(1 + B * k * k), a * .72, t0 / (1 + .42 * (k - 1))]); parts.push([k * Math.sqrt(1 + B * k * k) * 1.0007, a * .28, t0 * 2.6 / (1 + .2 * (k - 1))]); }
+    var out = additive(freq, dur, parts, .006), n = Math.min(out.length, Math.round(.03 * SR)), lp = 0;
+    for (var i = 0; i < n; i++) { lp += .08 * (nz() - lp); out[i] += lp * .5 * v * (1 - i / n) * (1 - i / n); } // felt thump
+    return out;
+  }
+  function bell(freq, dur, kind) { // 'rin' (singing bowl) | 'box' (music box) | 'cel' (celesta) | 'chime'
+    var p = kind === 'rin' ? [[1, 1, dur * .45], [1.003, .6, dur * .5], [2.71, .34, dur * .22], [2.72, .2, dur * .2], [5.15, .1, dur * .1], [8.2, .04, dur * .05]] :
+      kind === 'box' ? [[1, 1, .9], [2.0, .12, .5], [5.4, .22, .12], [8.9, .08, .05]] :
+        kind === 'cel' ? [[1, 1, 1.3], [2, .28, .8], [3, .07, .45], [4.02, .1, .3], [6.3, .04, .12]] :
+          [[1, 1, dur * .4], [2.0, .5, dur * .3], [2.99, .28, dur * .22], [4.2, .2, dur * .14], [5.43, .1, dur * .1], [6.8, .05, dur * .07]];
+    return additive(freq, dur, p, kind === 'rin' ? .012 : .002);
+  }
+  function wood(freq, dur) { // small wooden strike
+    var out = additive(freq, dur, [[1, 1, .045], [2.42, .5, .02], [4.1, .25, .01]], .0008), n = Math.min(out.length, 300);
+    for (var i = 0; i < n; i++) out[i] += nz() * .5 * Math.pow(1 - i / n, 3);
+    return out;
+  }
+  /* wavetable voices: strings / winds / horn / organ */
+  var TS = 2048, tcache = {};
+  var SPEC = {
+    str: function (k, fr) { return (1 / k) * (1 / (1 + Math.pow(fr / 4300, 4))) * (1 + .9 * Math.exp(-Math.pow((fr - 520) / 260, 2)) + .5 * Math.exp(-Math.pow((fr - 2500) / 700, 2))); },
+    strS: function (k, fr) { return (1 / Math.pow(k, 1.3)) * (1 / (1 + Math.pow(fr / 2400, 4))) * (1 + .7 * Math.exp(-Math.pow((fr - 480) / 260, 2))); },
+    cla: function (k, fr) { return (k % 2 ? 1 / k : .07 / k) * (1 / (1 + Math.pow(fr / 2600, 4))); },
+    flu: function (k, fr) { return [1, .34, .11, .05, .02, .01][k - 1] || 0; },
+    obo: function (k, fr) { return (1 / Math.pow(k, .8)) * (.25 + Math.exp(-Math.pow((fr - 1150) / 520, 2)) + .4 * Math.exp(-Math.pow((fr - 2900) / 600, 2))) * (1 / (1 + Math.pow(fr / 4200, 4))); },
+    hrn: function (k, fr) { return (1 / Math.pow(k, 1.25)) * (1 / (1 + Math.pow(fr / 1300, 3))); },
+    hrnB: function (k, fr) { return (1 / k) * (1 / (1 + Math.pow(fr / 2600, 3))); },
+    org: function (k, fr) { return ({ 1: 1, 2: .62, 3: .2, 4: .42, 6: .12, 8: .2 })[k] || 0; }
+  };
+  function table(kind, freq) {
+    var key = kind + Math.round(freq); if (tcache[key]) return tcache[key];
+    var t = new Float32Array(TS + 1), K = Math.min(48, Math.floor(15000 / freq)), k, i, pk = 0;
+    for (k = 1; k <= K; k++) { var a = SPEC[kind](k, k * freq); if (a < 1e-4) continue; var ph = kind === 'org' ? 0 : rnd() * TAU; for (i = 0; i < TS; i++) t[i] += a * Math.sin(TAU * k * i / TS + ph); }
+    for (i = 0; i < TS; i++) if (Math.abs(t[i]) > pk) pk = Math.abs(t[i]);
+    for (i = 0; i < TS; i++) t[i] /= pk; t[TS] = t[0];
+    return (tcache[key] = t);
+  }
+  /** sustained voice. o:{kind, kindB, att, rel, vib:[rate,depth,delay], det:[cents], swell:[pos,amount], bright:[b0,b1], breath, gliss:[fromHz, time]} */
+  function voice(freq, dur, o) {
+    var n = Math.round(dur * SR), out = new Float32Array(n), tA = table(o.kind, freq), tB = o.kindB ? table(o.kindB, freq) : null;
+    var det = o.det || [0], nv = det.length, att = (o.att || .15) * SR, rel = (o.rel || .3) * SR, vib = o.vib || [5.4, .004, .25], sw = o.swell || [.5, 0], br = o.bright || [0, 0], i, v;
+    var env = new Float32Array(n);
+    for (i = 0; i < n; i++) {
+      var e = i < att ? Math.pow(.5 - .5 * Math.cos(Math.PI * i / att), 1.2) : 1; if (i > n - rel) e *= Math.pow((n - i) / rel, 1.6);
+      var u = i / n; e *= 1 + sw[1] * (Math.exp(-Math.pow((u - sw[0]) / .3, 2)) - .5); env[i] = e;
+    }
+    for (v = 0; v < nv; v++) {
+      var f0 = freq * Math.pow(2, det[v] / 1200), ph = rnd() * TS, vr = vib[0] * (1 + (rnd() - .5) * .12), vp = rnd() * TAU, g = 1 / Math.sqrt(nv), drift = rnd() * 10;
+      for (i = 0; i < n; i++) {
+        var t = i / SR, vd = vib[1] * clamp((t - vib[2]) / .5, 0, 1), fi = f0 * (1 + vd * Math.sin(TAU * vr * t + vp) + .0008 * Math.sin(t * 1.3 + drift));
+        if (o.gliss && t < o.gliss[1]) fi *= Math.pow(o.gliss[0] / freq, 1 - t / o.gliss[1]);
+        ph += fi * TS / SR; if (ph >= TS) ph -= TS;
+        var ip = ph | 0, fr = ph - ip, s = tA[ip] + fr * (tA[ip + 1] - tA[ip]);
+        if (tB) { var b = clamp(br[0] + (br[1] - br[0]) * env[i], 0, 1); s = s * (1 - b) + (tB[ip] + fr * (tB[ip + 1] - tB[ip])) * b; }
+        out[i] += s * g * env[i];
+      }
+    }
+    if (o.breath) { var lp = 0, lp2 = 0, c = clamp(TAU * freq * 2.2 / SR, 0, .9); for (i = 0; i < n; i++) { lp += c * (nz() - lp); lp2 += c * .5 * (lp - lp2); out[i] += (lp - lp2) * o.breath * env[i]; } }
+    return out;
+  }
+  /* formant-synthesised soprano / choir (a synthetic vocal timbre — not a recording of a singer) */
+  var VOW = {
+    a: [[800, 80, 1], [1150, 90, .5], [2900, 120, .05], [3900, 130, .1], [4950, 140, .01]],
+    o: [[450, 70, 1], [800, 80, .3], [2830, 100, .08], [3800, 120, .08], [4950, 135, .006]],
+    u: [[325, 50, 1], [700, 60, .16], [2700, 170, .03], [3800, 180, .02], [4950, 200, .002]]
+  };
+  /** line: [[t, midi], ...] sung legato from line[0].t for dur seconds. o:{vowel:[v0,v1], singers, vib, g} */
+  function vox(line, dur, o) {
+    var n = Math.round(dur * SR), out = new Float32Array(n), BL = 96, K = 22, singers = o.singers || 1, s, k, i;
+    var att = (o.att || .5) * SR, rel = (o.rel || .9) * SR, v0 = VOW[o.vowel[0]], v1 = VOW[o.vowel[1]];
+    for (s = 0; s < singers; s++) {
+      var det = singers > 1 ? (s - (singers - 1) / 2) * 9 + (rnd() - .5) * 4 : 0, vr = 5.3 + rnd() * .7, vp = rnd() * TAU, lag = singers > 1 ? rnd() * .03 : 0;
+      var ph = new Float64Array(K), amp = new Float64Array(K), tgt = new Float64Array(K), cur = line[0][1], idx = 0, lpn = 0, lpn2 = 0, fl = 0;
+      for (k = 0; k < K; k++) ph[k] = rnd() * TAU;
+      for (i = 0; i < n; i += BL) {
+        var t = i / SR - lag; while (idx + 1 < line.length && t >= line[idx + 1][0] - line[0][0]) idx++;
+        cur += (line[idx][1] - cur) * (1 - Math.exp(-BL / SR / .05)); // portamento
+        var vdep = (o.vib === undefined ? .011 : o.vib) * clamp((t - .35) / .8, 0, 1), jit = .0015 * Math.sin(t * 2.3 + s * 3) + .001 * Math.sin(t * 7.1 + s);
+        var f0 = hz(cur + det / 100) * (1 + vdep * Math.sin(TAU * vr * t + vp) + jit), mixv = clamp(t / dur, 0, 1), ev = 1;
+        if (i < att) ev = Math.pow(.5 - .5 * Math.cos(Math.PI * i / att), 1.3); if (i > n - rel) ev *= Math.pow(Math.max(0, n - i) / rel, 1.5);
+        var F1 = Math.max(v0[0][0] + (v1[0][0] - v0[0][0]) * mixv, f0 * 1.03);
+        for (k = 0; k < K; k++) {
+          var fr = f0 * (k + 1), a = 0;
+          if (fr < 9000) { for (var j = 0; j < 5; j++) { var Fc = j === 0 ? F1 : v0[j][0] + (v1[j][0] - v0[j][0]) * mixv, bw = (v0[j][1] + (v1[j][1] - v0[j][1]) * mixv) * 1.5, ga = v0[j][2] + (v1[j][2] - v0[j][2]) * mixv, x = (fr - Fc) / bw; a += ga / (1 + x * x); } a *= Math.pow(k + 1, -1.15); }
+          tgt[k] = a * ev;
+        }
+        var end = Math.min(n, i + BL);
+        for (k = 0; k < K; k++) {
+          if (tgt[k] < 1e-5 && amp[k] < 1e-5) { amp[k] = tgt[k]; continue; }
+          var w = TAU * f0 * (k + 1) / SR, p = ph[k], a0 = amp[k], da = (tgt[k] - a0) / BL;
+          for (var q = i; q < end; q++) { out[q] += Math.sin(p) * a0; p += w; a0 += da; }
+          ph[k] = p % TAU; amp[k] = tgt[k];
+        }
+        for (q = i; q < end; q++) { lpn += .22 * (nz() - lpn); lpn2 += .05 * (lpn - lpn2); out[q] += (lpn - lpn2) * .05 * ev; } // breath
+      }
+    }
+    var g = 1 / Math.sqrt(singers); for (i = 0; i < n; i++) out[i] *= g;
+    return out;
+  }
+  /* noise shaping for foley */
+  function biquadBP(buf, fc0, fc1, Q) { // band-pass with swept centre
+    var n = buf.length, x1 = 0, x2 = 0, y1 = 0, y2 = 0, b0 = 0, a1 = 0, a2 = 0, a0 = 1;
+    for (var i = 0; i < n; i++) {
+      if ((i & 63) === 0) { var fc = fc0 * Math.pow(fc1 / fc0, i / n), w = TAU * fc / SR, al = Math.sin(w) / (2 * Q); a0 = 1 + al; b0 = al / a0; a1 = -2 * Math.cos(w) / a0; a2 = (1 - al) / a0; }
+      var x = buf[i], y = b0 * x - b0 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = x; y2 = y1; y1 = y; buf[i] = y;
+    }
+    return buf;
+  }
+  /** shaped noise. o:{f0,f1,Q, env(u)->amp, crackle(0..1), mod:[rate,depth]} */
+  function noise(dur, o) {
+    var n = Math.round(dur * SR), buf = new Float32Array(n), i, cr = o.crackle || 0, gate = 1, hold = 0;
+    for (i = 0; i < n; i++) {
+      var s = nz();
+      if (cr) { if (hold-- <= 0) { gate = rnd() < cr ? Math.pow(rnd(), 2) * 1.6 : 0; hold = 20 + (rnd() * 500 | 0); } s *= gate; }
+      buf[i] = s;
+    }
+    biquadBP(buf, o.f0, o.f1 || o.f0, o.Q || 1);
+    for (i = 0; i < n; i++) { var u = i / n, e = o.env ? o.env(u) : Math.sin(Math.PI * u); if (o.mod) e *= 1 - o.mod[1] * (.5 + .5 * Math.sin(TAU * o.mod[0] * i / SR + (o.mod[2] || 0))); buf[i] *= e; }
+    return buf;
+  }
+  function drop(f0, f1, dur) { // water / ink drop: rising chirp with fast decay
+    var n = Math.round(dur * SR), out = new Float32Array(n), ph = 0;
+    for (var i = 0; i < n; i++) { var u = i / n, fq = f0 * Math.pow(f1 / f0, Math.pow(u, .35)); ph += TAU * fq / SR; out[i] = Math.sin(ph) * Math.exp(-u * 9) * Math.min(1, i / 60); }
+    return out;
+  }
+  function chirp(dur, fa, fb, wob) { // small bird
+    var n = Math.round(dur * SR), out = new Float32Array(n), ph = 0;
+    for (var i = 0; i < n; i++) { var u = i / n, fq = fa + (fb - fa) * u + Math.sin(u * wob * TAU) * 260; ph += TAU * fq / SR; out[i] = Math.sin(ph) * Math.pow(Math.sin(Math.PI * u), 1.5) * (.6 + .4 * Math.sin(u * wob * 2 * TAU)); }
+    return out;
+  }
+
+  /* ---------------- reverb: FFT convolution with synthetic decaying-noise rooms ---------------- */
+  function fft(re, im, inv) {
+    var n = re.length, i, j = 0, k, t;
+    for (i = 1; i < n; i++) { var bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    for (var len = 2; len <= n; len <<= 1) {
+      var ang = TAU / len * (inv ? 1 : -1), wr = Math.cos(ang), wi = Math.sin(ang), half = len >> 1;
+      for (i = 0; i < n; i += len) {
+        var cr = 1, ci = 0;
+        for (k = 0; k < half; k++) {
+          var a = i + k, b = a + half, xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+          t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+        }
+      }
+    }
+    if (inv) for (i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+  }
+  function makeIR(len, rtLo, rtHi, pre, sd) {
+    var n = Math.round(len * SR), ir = new Float32Array(n), s = sd, lp = 0, lp2 = 0, p0 = Math.round(pre * SR), i, e = 0;
+    function r() { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return ((s >>> 0) / 4294967296) * 2 - 1; }
+    for (i = p0; i < n; i++) {
+      var t = (i - p0) / SR, w = r() + r() + r(); lp += .14 * (w - lp); var hi = w - lp; lp2 += .45 * (hi - lp2);
+      ir[i] = (lp * 1.05 * Math.exp(-6.91 * t / rtLo) + lp2 * Math.exp(-6.91 * t / rtHi)) * Math.min(1, t / .012);
+    }
+    [[.011, .5], [.017, -.42], [.023, .36], [.031, -.3], [.043, .24], [.057, -.18]].forEach(function (er, k) { var j = p0 + Math.round((er[0] + (sd % 7) * .0009 * (k + 1)) * SR); if (j < n) ir[j] += er[1] * .9; });
+    for (i = 0; i < n; i++) e += ir[i] * ir[i]; e = Math.sqrt(e); for (i = 0; i < n; i++) ir[i] /= e;
+    return ir;
+  }
+  function convolve(x, ir, out, gain) {
+    var M = ir.length, size = 1; while (size < M * 2) size <<= 1; var hop = size - M, hr = new Float64Array(size), hi = new Float64Array(size), i;
+    for (i = 0; i < M; i++) hr[i] = ir[i]; fft(hr, hi, false);
+    var xr = new Float64Array(size), xi = new Float64Array(size);
+    for (var pos = 0; pos < x.length; pos += hop) {
+      xr.fill(0); xi.fill(0); var any = false, lim = Math.min(hop, x.length - pos);
+      for (i = 0; i < lim; i++) { var v = x[pos + i]; xr[i] = v; if (v !== 0) any = true; }
+      if (!any) continue;
+      fft(xr, xi, false);
+      for (i = 0; i < size; i++) { var a = xr[i], b = xi[i]; xr[i] = a * hr[i] - b * hi[i]; xi[i] = a * hi[i] + b * hr[i]; }
+      fft(xr, xi, true);
+      for (i = 0; i < size && pos + i < out.length; i++) out[pos + i] += xr[i] * gain;
+    }
+  }
+
+  /* ---------------- the score：一昼夜 ---------------- */
+  function compose(log) {
+    var mus = new Stem(), vocal = new Stem(), fol = new Stem();
+    // ----- 乐器 -----
+    function qin(n, t, g, pan, dur) { mus.add(pluck(f(n), dur || 6, { t60: 5.2, bright: .3, damp: .42, pos: .12, body: .32 }), t, { g: g, pan: pan || 0, hall: .55 }); }                 // 古琴：散音
+    function fan(n, t, g, pan) { mus.add(bell(f(n), 3.4, 'cel'), t, { g: g, pan: pan || 0, hall: .6, cath: .2 }); }                                                                 // 古琴：泛音
+    function zheng(n, t, g, pan, dur) { mus.add(pluck(f(n), dur || 2.8, { t60: 2.6, bright: .78, damp: .24, pos: .16, body: .62 }), t, { g: g, pan: pan || 0, hall: .45 }); }         // 筝
+    function pipa(n, t, g, pan, dur) { mus.add(pluck(f(n), dur || 1.0, { t60: .85, bright: .95, damp: .18, pos: .1, body: .75 }), t, { g: g, pan: pan || 0, hall: .3 }); }             // 琵琶
+    function lun(n, t, dur, g, pan) { var k = Math.round(dur * 13); for (var i = 0; i < k; i++) pipa(n, t + i / 13 + (rnd() - .5) * .008, g * (.75 + .25 * Math.sin(Math.PI * i / k)) * (.85 + .3 * rnd()), pan, .5); } // 轮指
+    function xiao(n, t, dur, g, pan, o) { o = o || {}; mus.add(voice(f(n), dur, { kind: 'flu', att: o.att || .22, rel: o.rel || .5, vib: [4.6, .007, .5], det: [0], swell: [.5, .3], breath: .13, gliss: o.gliss }), t, { g: g, pan: pan || 0, hall: .6, cath: .15 }); }   // 箫
+    function dizi(n, t, dur, g, pan, o) { o = o || {}; mus.add(voice(f(n), dur, { kind: 'obo', att: .035, rel: .1, vib: [5.6, .005, .18], det: [0], swell: [.4, .2], breath: .06, gliss: o.gliss }), t, { g: g * .55, pan: pan || 0, hall: .4 }); mus.add(voice(f(n), dur, { kind: 'flu', att: .03, rel: .1, vib: [5.6, .005, .18], det: [0], swell: [.4, .2], breath: .1, gliss: o.gliss }), t, { g: g, pan: pan || 0, hall: .4 }); } // 笛
+    function xun(n, t, dur, g, pan) { mus.add(voice(f(n), dur, { kind: 'flu', att: .5, rel: 1.1, vib: [3.6, .009, .7], det: [-4, 4], swell: [.45, .4], breath: .2 }), t, { g: g, pan: pan || 0, hall: .5, cath: .5 }); }      // 埙
+    function erhu(n, t, dur, g, pan, o) { o = o || {}; mus.add(voice(f(n), dur, { kind: 'strS', kindB: 'str', bright: [.35, .9], att: .09, rel: .22, vib: [5.9, .008, .16], det: [0, 2], swell: [.5, .35], gliss: o.gliss }), t, { g: g, pan: pan || 0, hall: .46 }); } // 二胡
+    function pad(n, t, dur, g, pan, o) { o = o || {}; mus.add(voice(f(n), dur, { kind: 'strS', kindB: 'str', bright: o.bright || [.05, .4], att: o.att || 1.6, rel: o.rel || 2.2, vib: [5.2, .004, .5], det: [-7, 0, 6, 11], swell: [.55, .3] }), t, { g: g, pan: pan || 0, hall: .5, cath: o.cath || .2 }); }
+    function zhong(n, t, g, pan) { mus.add(bell(f(n), 6, 'chime'), t, { g: g, pan: pan || 0, hall: .3, cath: .7 }); }                                                                 // 编钟
+    function gu(t, g, n) { var fr = f(n || 'D2'); mus.add(additive(fr, 1.6, [[1, 1, .42], [1.5, .5, .24], [2.1, .3, .16], [.5, .3, .2]], .003), t, { g: g, hall: .4 }); fol.add(noise(.06, { f0: 900, f1: 300, Q: .7, env: function (u) { return 1 - u; } }), t, { g: g * .25, hall: .3 }); } // 鼓
+    function ban(t, g, pan) { mus.add(wood(1250 + rnd() * 80, .22), t, { g: g, pan: pan || 0, hall: .35 }); }                                                                        // 板
+    function ling(t, g, pan) { mus.add(bell(f('A6') * (1 + rnd() * .02), 1.2, 'box'), t, { g: g, pan: pan || 0, hall: .5 }); }                                                         // 碰铃
+    function gliss(notes, t, step, g, pan0, pan1) { notes.forEach(function (n, i) { zheng(n, t + i * step, g * (.7 + .3 * i / notes.length), pan0 + (pan1 - pan0) * i / (notes.length - 1), 2.4); }); } // 筝刮奏
+    var PENT = ['D', 'E', 'F#', 'A', 'B'];
+    function scale(o0, o1) { var a = []; for (var o = o0; o <= o1; o++) PENT.forEach(function (p) { a.push(p + o); }); return a; }
+    // 月主题：商 角 徵— 羽— 徵 角 | 商— 宫 商 | 羽——   (in D 宫：E F# A B / B3 作结)
+    var THEME = [['E4', 0, 1], ['F#4', 1, 1], ['A4', 2, 2], ['B4', 4, 2], ['A4', 6, 1], ['F#4', 7, 1], ['E4', 8, 2], ['D4', 10, 1], ['E4', 11, 1], ['B3', 12, 4]];
+    function oct(n, k) { return m(n) + 12 * k; }
+
+    /* ===== 序 0–13：一点墨，一声琴 ===== */
+    qin('D2', 2.1, .5, -.1); fan('A5', 2.14, .1, .2);
+    qin('A2', 5.0, .34, .1); fan('E5', 6.2, .08, -.2);
+    xun('E4', 7.2, 1.5, .16, 0); xun('F#4', 8.5, 1.3, .16, 0); xun('A4', 9.6, 3.2, .18, 0);     // 主题的头三个音：问
+    qin('D2', 9.6, .42, 0); fan('B5', 11.4, .08, .25);
+    pad('D3', 8.5, 6.5, .03, -.3); pad('A3', 9.2, 6, .028, .3);
+
+    /* ===== 一 · 黄昏 13–39：春江花月夜。箫唱主题，筝作水波 ===== */
+    var J = 16.2;
+    zhong('D4', 13.9, .09, 0);
+    THEME.forEach(function (q) { xiao(oct(q[0], 0), J + q[1], q[2] + .2, .34, -.05, { rel: .45 }); });
+    [['D2', 0], ['B2', 4], ['A2', 8], ['B1', 12]].forEach(function (q) { qin(q[0], J + q[1], .46, -.15); });
+    for (var b = 0; b < 15; b++) { // 潮：每两拍一道上行的筝
+      var root = [0, 0, 3, 3, 2, 2, 4, 4, 0, 0, 3, 3, 2, 4, 0][b], sc = scale(3, 5), st0 = root + 2 + (b % 2);
+      for (var k = 0; k < 6; k++) zheng(sc[st0 + k], J + .5 + b * 1.44 + k * .16 + (rnd() - .5) * .01, .1 + .012 * k, (k / 5 - .5) * .8, 2.2);
+    }
+    pad('D3', J - 1.5, 24, .05, -.3); pad('A3', J - 1, 23.5, .045, .25); pad('B3', J + 3, 19, .03, 0); pad('F#4', J + 7, 15, .022, .1);
+    // 答句（江畔何人初见月）：高八度，琵琶轮指托着
+    var J2 = 29.0; zhong('A3', 28.6, .08, .1);
+    [['A4', 0, 1], ['B4', 1, 1], ['D5', 2, 2], ['E5', 4, 2], ['D5', 6, 1], ['B4', 7, 1], ['A4', 8, 2.6]].forEach(function (q) { xiao(q[0], J2 + q[1], q[2] + .2, .32, .05); });
+    lun('A4', J2 + 2, 1.8, .045, .4); lun('B4', J2 + 4, 1.8, .045, .4); lun('E4', J2 + 8, 2.4, .04, .4);
+    qin('D2', J2, .42, -.15); qin('B1', J2 + 4, .42, -.15); qin('A1', J2 + 8, .46, -.15);
+
+    /* ===== 二 · 人定 39–62：山居秋暝。古琴独奏，泛音如滴水 ===== */
+    var Sh = 43.0;
+    THEME.forEach(function (q) { qin(oct(q[0], -1), Sh + q[1] * 1.08, .5, -.05, 5); if (q[2] >= 2) fan(oct(q[0], 1), Sh + q[1] * 1.08 + .05, .05, .3); });
+    [[41.6, 'B5'], [45.3, 'E6'], [48.4, 'A5'], [51.7, 'F#6'], [55.2, 'B5'], [58.6, 'E6']].forEach(function (q, i) { fan(q[1], q[0], .075, i % 2 ? .45 : -.45); }); // 清泉石上流
+    xiao('A4', 53.4, 2.6, .2, .1, { att: .6 }); xiao('B4', 55.9, 1.6, .2, .1); xiao('A4', 57.4, 1.2, .18, .1); xiao('F#4', 58.5, 3.4, .2, .1, { rel: 1.6 });
+    pad('D3', 52, 10.5, .03, -.2); pad('A3', 53, 9.5, .026, .2);
+    qin('D2', 57.0, .4, -.1); qin('B1', 60.0, .44, -.1);
+
+    /* ===== 三 · 夜半 62–86：枫桥夜泊。埙与三声钟 ===== */
+    [['B3', 65.4, 2.2], ['D4', 67.6, 1.2], ['E4', 68.8, 3.2], ['D4', 72.2, 1.2], ['B3', 73.4, 3.8]].forEach(function (q) { xun(q[0], q[1], q[2], .3, -.05); });
+    qin('B1', 64.2, .5, 0); qin('F#2', 69.0, .36, .1); qin('B1', 73.4, .46, 0);
+    pad('F#5', 63.5, 13, .014, .3, { bright: [0, .25], att: 3, rel: 3 }); pad('B4', 64, 12, .016, -.3, { bright: [0, .25], att: 3, rel: 3 });
+    [77.6, 80.2, 82.8].forEach(function (t, i) { // 夜半钟声到客船
+      mus.add(additive(f('A2'), 7, [[1, 1, 3.4], [2.0, .62, 2.6], [2.76, .34, 1.8], [3.3, .2, 1.3], [4.1, .14, .9], [5.4, .08, .6], [.5, .5, 3.8]], .006), t, { g: .34 - i * .03, pan: .25, hall: .35, cath: .8 });
+      fol.add(noise(.09, { f0: 500, f1: 220, Q: .6, env: function (u) { return 1 - u; } }), t, { g: .1, pan: .25, hall: .5 });
+    });
+    xun('E4', 78.6, 1.4, .18, -.1); xun('F#4', 81.2, 1.4, .18, -.1);
+    // 第三声钟后：天色渐亮
+    pad('D3', 82.6, 6, .06, -.3, { att: 3, rel: 1.4, bright: [0, .6] }); pad('A3', 83, 5.6, .055, .3, { att: 3, rel: 1.4, bright: [0, .6] }); pad('F#4', 83.6, 5, .045, 0, { att: 2.8, rel: 1.4, bright: [0, .7] }); pad('A4', 84.2, 4.4, .035, .2, { att: 2.4, rel: 1.4, bright: [0, .7] });
+    gliss(scale(3, 5).slice(2, 15), 84.9, .075, .11, -.6, .6);
+
+    /* ===== 四 · 日出 86–108：早发白帝城。笛、琵琶、鼓，快板 ===== */
+    var Bt = 60 / 132, B0 = 88.6;
+    zhong('D4', 86.9, .12, 0); gu(86.9, .3, 'D2');
+    var dm = [ // 两句，各四小节
+      ['A5', 0, 1], ['B5', 1, 1], ['D6', 2, 1], ['B5', 3, 1], ['A5', 4, 1], ['F#5', 5, 1], ['E5', 6, 1], ['F#5', 7, 1], ['A5', 8, 2], ['B5', 10, 1], ['A5', 11, 1], ['F#5', 12, 1], ['E5', 13, 1], ['D5', 14, 2],
+      ['E5', 16, 1], ['F#5', 17, 1], ['A5', 18, 1], ['B5', 19, 1], ['D6', 20, 1.5], ['E6', 21.5, .5], ['D6', 22, 1], ['B5', 23, 1], ['A5', 24, 1], ['B5', 25, 1], ['D6', 26, 1], ['B5', 27, 1], ['A5', 28, 4]];
+    dm.forEach(function (q) { dizi(q[0], B0 + q[1] * Bt, q[2] * Bt + .04, .2, .12); if (q[1] >= 16) erhu(oct(q[0], -1), B0 + q[1] * Bt, q[2] * Bt + .04, .06, -.25); });
+    var bch = [['D3', ['A3', 'D4', 'F#4']], ['B2', ['F#3', 'B3', 'D4']], ['A2', ['A3', 'E4', 'A4']], ['D3', ['A3', 'D4', 'F#4']], ['E3', ['B3', 'E4', 'A4']], ['B2', ['F#3', 'B3', 'D4']], ['A2', ['A3', 'E4', 'A4']], ['D3', ['A3', 'D4', 'F#4']]];
+    bch.forEach(function (ch, bar) {
+      var t = B0 + bar * 4 * Bt, dy = .75 + .25 * bar / 7;
+      for (var e = 0; e < 8; e++) { pipa(ch[1][[0, 1, 2, 1, 0, 2, 1, 2][e]], t + e * Bt / 2, (e % 2 ? .1 : .15) * dy, .35); if (e % 4 === 0) pipa(ch[0], t + e * Bt / 2, .14 * dy, .3); }
+      gu(t, .34 * dy, 'D2'); gu(t + 2 * Bt, .24 * dy, 'A2'); ban(t + Bt, .1, -.4); ban(t + 3 * Bt, .1, -.4); if (bar >= 4) { ban(t + 2.5 * Bt, .07, -.4); ban(t + 3.5 * Bt, .07, -.4); }
+      pad(ch[0], t, 4 * Bt + .5, .07 * dy, -.2, { att: .3, rel: .6, bright: [.1, .6] }); pad(ch[1][2], t, 4 * Bt + .5, .04 * dy, .25, { att: .3, rel: .6, bright: [.1, .6] });
+      qin(oct(ch[0], -1), t, .28, -.1, 3);
+    });
+    gliss(scale(3, 5).slice(0, 13), B0 - 1.1, .07, .1, -.6, .6);
+    // 两岸猿声：两声滑音，一左一右
+    dizi('E6', 99.5, .7, .1, -.7, { gliss: [f('B5'), .28] }); dizi('D6', 100.5, .8, .09, .7, { gliss: [f('A5'), .3] }); dizi('E6', 101.6, .6, .07, -.7, { gliss: [f('B5'), .25] });
+    // 过了万重山：渐慢，化入湖面
+    [['A5', 103.4, 1.2], ['F#5', 104.6, 1.0], ['E5', 105.6, 1.3], ['D5', 106.9, 2.6]].forEach(function (q) { xiao(q[0], q[1], q[2] + .3, .2, .1); });
+    gu(103.2, .28, 'D2'); qin('D2', 103.2, .4, 0); qin('A2', 105.6, .32, 0); gliss(scale(3, 5).slice(3, 13).reverse(), 106.4, .09, .07, .5, -.5);
+
+    /* ===== 五 · 日中 108–131：饮湖上初晴后雨。二胡如歌，三拍子；雨来，琵琶点滴 ===== */
+    var W0 = 111.0, Wb = 2.5, Wq = Wb / 3;
+    var wm = [[['E4', 0, 2], ['F#4', 2, 1]], [['A4', 0, 3]], [['B4', 0, 2], ['A4', 2, 1]], [['F#4', 0, 3]], [['E4', 0, 2], ['D4', 2, 1]], [['E4', 0, 2], ['F#4', 2, 1]], [['B3', 0, 3]]];
+    var wch = [['D3', 'A3', 'F#4'], ['D3', 'A3', 'F#4'], ['B2', 'F#3', 'D4'], ['B2', 'F#3', 'D4'], ['A2', 'E3', 'A3'], ['A2', 'E3', 'B3'], ['B2', 'F#3', 'D4']];
+    wm.forEach(function (bar, bi) {
+      var t = W0 + bi * Wb, rainy = bi >= 3;
+      bar.forEach(function (q) { erhu(oct(q[0], rainy ? 0 : 1), t + q[1] * Wq, q[2] * Wq + .1, rainy ? .1 : .14, -.1, bi === 0 && q[1] === 0 ? { gliss: [f('D5'), .18] } : null); });
+      var ch = wch[bi]; zheng(ch[0], t, .16, -.3, 2.6); zheng(ch[1], t + Wq, .1, 0, 2.2); zheng(ch[2], t + 2 * Wq, .1, .3, 2.2); zheng(oct(ch[1], 1), t + 2.5 * Wq, .07, .4, 2);
+      pad(ch[0], t, Wb + .6, .035, -.2, { att: .5, rel: .9 }); pad(ch[2], t, Wb + .6, .028, .2, { att: .5, rel: .9 });
+    });
+    var rs = scale(5, 6); for (var r = 0; r < 46; r++) { var rt = 119.2 + Math.pow(rnd(), .8) * 11; pipa(rs[(rnd() * 8) | 0], rt, .05 + .05 * rnd(), rnd() * 1.6 - .8, .5); } // 雨：琵琶点滴
+    xiao('B4', 126.6, 2.0, .16, .2); xiao('A4', 128.5, 2.8, .16, .2, { rel: 1.4 });
+
+    /* ===== 落霞 131–139：一支箫 ===== */
+    [['B4', 131.6, 2.3], ['A4', 133.9, 1.6], ['F#4', 135.5, 1.3], ['E4', 136.8, 2.6]].forEach(function (q) { xiao(q[0], q[1], q[2] + .3, .3, 0); });
+    qin('D2', 131.6, .46, -.1); qin('A2', 134.0, .3, .1); qin('B1', 136.8, .46, -.1); fan('B5', 138.2, .07, .3);
+    pad('D3', 131, 8.5, .04, -.3); pad('B3', 131.5, 8, .03, .3);
+
+    /* ===== 六 · 黄昏 139–165：青玉案·元夕。鼓、笛、琵琶、筝，一夜鱼龙舞；然后——静 ===== */
+    var Y0 = 142.0, Yb = .5;
+    gu(140.0, .2, 'D2'); gu(140.75, .16, 'D2'); gu(141.25, .2, 'D2'); gu(141.5, .24, 'A2'); gu(141.75, .28, 'D2'); gliss(scale(3, 5).slice(0, 14), 141.0, .066, .1, -.7, .7);
+    var ym = [['D5', 0, 1], ['E5', 1, 1], ['F#5', 2, 1], ['A5', 3, 1], ['B5', 4, 1], ['A5', 5, 1], ['F#5', 6, 1], ['A5', 7, 1], ['B5', 8, 1], ['D6', 9, 1], ['B5', 10, 1], ['A5', 11, 1], ['F#5', 12, 1], ['E5', 13, 1], ['D5', 14, 2],
+      ['E5', 16, 1], ['F#5', 17, 1], ['A5', 18, 1], ['B5', 19, 1], ['D6', 20, 1], ['B5', 21, 1], ['A5', 22, 1], ['F#5', 23, 1], ['A5', 24, 1.5], ['B5', 25.5, .5], ['D6', 26, 2]];
+    ym.forEach(function (q) { var t = Y0 + q[1] * Yb, d = q[2] * Yb; dizi(q[0], t, d + .04, .19, .15); pipa(oct(q[0], -1), t, .13, .4, .7); zheng(oct(q[0], -1), t + .01, .08, -.4, 1.6); });
+    var ych = [['D3', ['A3', 'D4', 'F#4']], ['B2', ['F#3', 'B3', 'D4']], ['B2', ['F#3', 'B3', 'D4']], ['A2', ['A3', 'E4', 'A4']], ['E3', ['B3', 'E4', 'A4']], ['B2', ['F#3', 'B3', 'D4']], ['D3', ['A3', 'D4', 'F#4']]];
+    ych.forEach(function (ch, bar) {
+      var t = Y0 + bar * 4 * Yb, dy = .8 + .2 * bar / 6;
+      gu(t, .4 * dy, 'D2'); gu(t + 1.5 * Yb, .2 * dy, 'D2'); gu(t + 2 * Yb, .3 * dy, 'A2'); gu(t + 3 * Yb, .22 * dy, 'D2'); gu(t + 3.5 * Yb, .2 * dy, 'A2');
+      ban(t + Yb, .1, -.5); ban(t + 3 * Yb, .1, -.5); ling(t, .05, .6); ling(t + 2 * Yb, .04, .6);
+      for (var e = 0; e < 8; e++) pipa(ch[1][[0, 2, 1, 2, 0, 2, 1, 2][e]], t + e * Yb / 2, .075 * dy, .3, .5);
+      pad(ch[0], t, 4 * Yb + .5, .09 * dy, -.2, { att: .25, rel: .6, bright: [.15, .7] }); pad(ch[1][1], t, 4 * Yb + .5, .05 * dy, .1, { att: .25, rel: .6, bright: [.15, .7] }); pad(ch[1][2], t, 4 * Yb + .5, .05 * dy, .3, { att: .25, rel: .6, bright: [.15, .7] });
+      qin(oct(ch[0], -1), t, .3, -.1, 3);
+    });
+    // 凤箫声动：一组箫的和声
+    xiao('A4', 151.0, 4.6, .1, -.5, { att: .8, rel: 1 }); xiao('D5', 151.2, 4.4, .1, .5, { att: .8, rel: 1 }); xiao('F#5', 151.4, 4.2, .08, 0, { att: .8, rel: 1 });
+    // 蓦然回首：一切退去，只剩一支箫
+    zhong('D4', 156.2, .06, 0);
+    [['E4', 157.6, 1.4], ['F#4', 159.0, 1.0], ['A4', 160.0, 2.2], ['B4', 162.2, 2.6]].forEach(function (q) { xiao(q[0], q[1], q[2] + .4, .34, 0, { att: .35, rel: .8 }); });
+    qin('D2', 157.6, .5, -.1); qin('B1', 162.2, .5, -.1); fan('A5', 160.1, .07, .3);
+    vocal.add(vox([[0, m('A3')], [4.6, m('B3')]], 8.4, { vowel: ['u', 'u'], singers: 3, vib: .005, att: 2.2, rel: 2.6 }), 157.0, { g: .02, pan: -.3, hall: .3, cath: .8 });
+    vocal.add(vox([[0, m('D4')], [4.6, m('F#4')]], 8.4, { vowel: ['u', 'u'], singers: 3, vib: .005, att: 2.2, rel: 2.6 }), 157.0, { g: .018, pan: .3, hall: .3, cath: .8 });
+
+    /* ===== 跋 165–180：主题回到古琴，落在羽音 ===== */
+    var Ba = 166.4;
+    THEME.forEach(function (q) { qin(oct(q[0], -1), Ba + q[1] * .76, .5, -.05, 6); if (q[2] >= 2) fan(oct(q[0], 1), Ba + q[1] * .76 + .04, .055, .3); });
+    pad('D3', 165, 13, .04, -.3, { att: 2.6, rel: 4 }); pad('A3', 165.6, 12.4, .034, .3, { att: 2.6, rel: 4 }); pad('E4', 167, 11, .024, 0, { att: 2.6, rel: 4 });
+    vocal.add(vox([[0, m('A3')], [5, m('B3')], [9, m('A3')]], 12.6, { vowel: ['u', 'o'], singers: 3, vib: .005, att: 2.4, rel: 3.4 }), 165.8, { g: .02, pan: -.25, hall: .3, cath: .8 });
+    vocal.add(vox([[0, m('E4')], [5, m('F#4')], [9, m('E4')]], 12.6, { vowel: ['u', 'o'], singers: 3, vib: .005, att: 2.4, rel: 3.4 }), 165.8, { g: .017, pan: .25, hall: .3, cath: .8 });
+    zhong('D4', 174.6, .07, 0);                                   // 今夜，照你
+    qin('D2', 175.6, .46, -.1); qin('A2', 175.9, .3, .1); fan('B5', 176.4, .08, .2); fan('E6', 177.3, .05, -.2);
+
+    /* ===== 拟音 ===== */
+    function swish(t, dur, f0, f1, g, pan, cr, q) { fol.add(noise(dur, { f0: f0, f1: f1, Q: q || .9, crackle: cr || 0 }), t, { g: g, pan: pan || 0, hall: .25 }); }
+    fol.add(drop(360, 860, .22), 2.1, { g: .32, hall: .5 }); swish(2.1, .6, 1600, 500, .05, 0, 0, .6);                                 // 墨滴
+    fol.add(noise(6, { f0: 2400, f1: 3600, Q: .7, crackle: .45, env: function (u) { return Math.sin(Math.PI * u); } }), 3.2, { g: .05, hall: .2 }); // 笔行纸上
+    [13, 39, 62, 86, 108, 139].forEach(function (t0) { // 画帘：木轴一响，绢帛滑开
+      fol.add(wood(520, .2), t0 + .86, { g: .12, pan: 0, hall: .4 }); swish(t0 + .9, 2.2, 700, 2200, .12, -.4, .3); swish(t0 + .9, 2.2, 700, 2200, .12, .4, .3); fol.add(wood(430, .2), t0 + 3.0, { g: .07, hall: .4 });
+    });
+    [[15.7, -.4], [16.5, .4], [17.2, -.5], [41.0, -.3], [41.8, .3], [42.6, .4], [43.2, -.5], [64.8, -.5]].forEach(function (q) { fol.add(drop(420, 980, .16), q[0], { g: .12, pan: q[1], hall: .5 }); }); // 点墨
+    fol.add(noise(24, { f0: 380, f1: 460, Q: .5, env: function (u) { return .5 + .5 * Math.sin(Math.PI * u); }, mod: [.13, .5] }), 14.5, { g: .12, pan: 0, hall: .3 });              // 江潮
+    for (var w = 0; w < 9; w++) swish(16 + w * 2.6 + rnd(), 2.2, 500, 900, .05, (w % 2 ? .4 : -.4), 0, .5);
+    fol.add(noise(20, { f0: 2600, f1: 3000, Q: .6, crackle: .7, env: function (u) { return Math.sin(Math.PI * u); } }), 42, { g: .034, pan: .15, hall: .2 });                      // 泉
+    fol.add(noise(20, { f0: 700, f1: 800, Q: .5, env: function (u) { return Math.sin(Math.PI * u); }, mod: [.2, .6] }), 42, { g: .05, pan: -.4, hall: .3 });                          // 竹风
+    [46.2, 49.9, 54.6, 57.8].forEach(function (t, i) { fol.add(drop(700, 1500, .12), t, { g: .07, pan: i % 2 ? .3 : -.2, hall: .6 }); });                                             // 新雨后的滴水
+    fol.add(noise(22, { f0: 300, f1: 360, Q: .5, env: function (u) { return Math.sin(Math.PI * u); }, mod: [.11, .5] }), 63, { g: .08, hall: .3 });                                    // 夜水
+    [[66.2, .5], [66.55, .5], [70.3, -.3]].forEach(function (q) { fol.add(noise(.24, { f0: 1500, f1: 900, Q: 2.2, crackle: .9, env: function (u) { return Math.sin(Math.PI * u); } }), q[0], { g: .12, pan: q[1], hall: .8 }); }); // 乌啼（远）
+    fol.add(noise(21, { f0: 900, f1: 1500, Q: .45, env: function (u) { return Math.sin(Math.PI * Math.min(1, u * 1.15)) ; }, mod: [.9, .3] }), 87.4, { g: .15, hall: .25 });           // 江流
+    fol.add(noise(12.4, { f0: 5200, f1: 6000, Q: .5, crackle: .8, env: function (u) { return Math.min(1, u * 3) * Math.min(1, (1 - u) * 3); } }), 118.4, { g: .1, hall: .2 });       // 雨
+    fol.add(noise(12.4, { f0: 1100, f1: 1300, Q: .5, env: function (u) { return Math.min(1, u * 3) * Math.min(1, (1 - u) * 3); }, mod: [.3, .3] }), 118.4, { g: .06, hall: .3 });
+    [[144.6, 0], [145.9, -.4], [147.3, .4], [148.4, 0], [149.6, -.5], [150.7, .3], [151.9, -.1], [152.9, .2], [153.9, -.4], [154.8, .4]].forEach(function (q) { // 烟火
+      fol.add(noise(1.1, { f0: 1800, f1: 3200, Q: 1.5, env: function (u) { return u * u; } }), q[0] - 1.1, { g: .035, pan: q[1], hall: .4 });
+      fol.add(additive(58, 1.4, [[1, 1, .3], [1.6, .5, .2], [2.3, .3, .12]], .004), q[0], { g: .3, pan: q[1], hall: .6 });
+      fol.add(noise(1.8, { f0: 3800, f1: 5200, Q: .6, crackle: .75, env: function (u) { return Math.pow(1 - u, 1.4); } }), q[0] + .12, { g: .13, pan: q[1], hall: .5 });
+    });
+    fol.add(noise(14, { f0: 600, f1: 700, Q: .4, env: function (u) { return Math.sin(Math.PI * u); }, mod: [1.7, .3] }), 141.5, { g: .08, hall: .4 });                                   // 人声鼎沸（远）
+    swish(155.2, 4.2, 1400, 400, .08, 0, 0, .5);                                                                                                                                          // 热闹退到身后
+    swish(164.8, 3, 900, 2200, .06, 0, .3);                                                                                                                                               // 长卷展开
+
+    return { music: mus, vocal: vocal, foley: fol };
+  }
+
+  /* ---------------- master ---------------- */
+  function finishStem(st, irs, log) {
+    convolve(st.hall, irs.hallL, st.L, 1); convolve(st.hall, irs.hallR, st.R, 1);
+    convolve(st.cath, irs.cathL, st.L, 1); convolve(st.cath, irs.cathR, st.R, 1);
+    st.hall = st.cath = null;
+    // 28 Hz high-pass
+    [st.L, st.R].forEach(function (x) { var y1 = 0, x1 = 0, a = 1 / (1 + TAU * 28 / SR); for (var i = 0; i < N; i++) { var y = a * (y1 + x[i] - x1); x1 = x[i]; y1 = y; x[i] = y; } });
+  }
+  /** RBJ shelving filter, in place. type 'lo' | 'hi' */
+  function shelf(x, type, fc, gainDb) {
+    var A = Math.pow(10, gainDb / 40), w = TAU * fc / SR, cs = Math.cos(w), al = Math.sin(w) / 2 * Math.SQRT2, sq = 2 * Math.sqrt(A) * al, b0, b1, b2, a0, a1, a2;
+    if (type === 'lo') { b0 = A * ((A + 1) - (A - 1) * cs + sq); b1 = 2 * A * ((A - 1) - (A + 1) * cs); b2 = A * ((A + 1) - (A - 1) * cs - sq); a0 = (A + 1) + (A - 1) * cs + sq; a1 = -2 * ((A - 1) + (A + 1) * cs); a2 = (A + 1) + (A - 1) * cs - sq; }
+    else { b0 = A * ((A + 1) + (A - 1) * cs + sq); b1 = -2 * A * ((A - 1) + (A + 1) * cs); b2 = A * ((A + 1) + (A - 1) * cs - sq); a0 = (A + 1) - (A - 1) * cs + sq; a1 = 2 * ((A - 1) - (A + 1) * cs); a2 = (A + 1) - (A - 1) * cs - sq; }
+    b0 /= a0; b1 /= a0; b2 /= a0; a1 /= a0; a2 /= a0;
+    var x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (var i = 0; i < x.length; i++) { var xi = x[i], y = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = xi; y2 = y1; y1 = y; x[i] = y; }
+  }
+  function limiter(L, R, ceil) {
+    var LA = 288, g = new Float32Array(N), i, dq = new Int32Array(N), head = 0, tail = 0, red = 0, mnG = 1;
+    for (i = 0; i < N; i++) { var pk = Math.max(Math.abs(L[i]), Math.abs(R[i])); g[i] = pk > ceil ? ceil / pk : 1; }
+    var mn = new Float32Array(N);
+    for (i = 0; i < N + LA; i++) { // sliding minimum over the look-ahead window
+      if (i < N) { while (tail > head && g[dq[tail - 1]] >= g[i]) tail--; dq[tail++] = i; }
+      var j = i - LA; if (j < 0) continue; while (dq[head] < j) head++; mn[j] = g[dq[head]];
+    }
+    var e = 1, aC = Math.exp(-1 / (.0012 * SR)), rC = Math.exp(-1 / (.22 * SR));
+    for (i = 0; i < N; i++) { var tg = mn[i]; e = tg < e ? tg + (e - tg) * aC : tg + (e - tg) * rC; var gg = Math.min(e, g[i] < 1 ? g[i] : 1, 1); if (gg < .944) red++; if (gg < mnG) mnG = gg; L[i] *= gg; R[i] *= gg; }
+    limiter.maxGR = -20 * Math.log10(mnG);
+    return red / N;
+  }
+  /** Render everything. opts:{gain (dB, applied to the full mix before limiting)} -> {sr, mix:{L,R}, stems:{music,vocal,foley}, stats} */
+  function render(opts, log) {
+    opts = opts || {}; log = log || function () { };
+    var t0 = Date.now(); seed = 20261113; tcache = {};
+    var stems = compose(log); log('composed in ' + (Date.now() - t0) + ' ms');
+    var irs = { hallL: makeIR(3.4, 2.9, 1.5, .018, 9001), hallR: makeIR(3.4, 2.9, 1.5, .021, 9203), cathL: makeIR(5.4, 5.6, 2.4, .034, 9407), cathR: makeIR(5.4, 5.6, 2.4, .039, 9601) };
+    ['music', 'vocal', 'foley'].forEach(function (k) { finishStem(stems[k], irs, log); });
+    // tone: keep the warmth, clear the mud, let the air through (so it also speaks on small speakers)
+    [stems.music.L, stems.music.R].forEach(function (x) { shelf(x, 'lo', 190, -6.5); shelf(x, 'hi', 3600, 4); });
+    [stems.vocal.L, stems.vocal.R].forEach(function (x) { shelf(x, 'lo', 260, -8); shelf(x, 'hi', 4200, 2.5); });
+    log('reverb done at ' + (Date.now() - t0) + ' ms');
+    var G = db(opts.gain === undefined ? 0 : opts.gain), L = new Float32Array(N), R = new Float32Array(N), i;
+    var secs = [[0, 13], [13, 39], [39, 62], [62, 86], [86, 108], [108, 131], [131, 139], [139, 156], [156, 165], [165, 180]];
+    function rmsOf(Ls, Rs, a, b) { var e = 0; for (var j = a; j < b; j++) e += Ls[j] * Ls[j] + Rs[j] * Rs[j]; return 10 * Math.log10(e / (2 * (b - a)) + 1e-12); }
+    // --- mastering ride: bring each act to its place on the dynamic curve (quiet → tender → grand → intimate → sacred → still)
+    var TARGET = opts.target || [-29, -22.5, -24.5, -25, -17, -21.5, -24, -15.5, -25.5, -23.5], pre = [], trim = [];
+    secs.forEach(function (sc, k) {
+      var a = sc[0] * SR, b = sc[1] * SR, e = 0;
+      ['music', 'vocal', 'foley'].forEach(function (key) { var st = stems[key]; log('  pre ' + key + ' ' + sc[0] + '-' + sc[1] + ': ' + rmsOf(st.L, st.R, a, b).toFixed(1) + ' dB'); });
+      for (var j = a; j < b; j++) { var l = stems.music.L[j] + stems.vocal.L[j] + stems.foley.L[j], r = stems.music.R[j] + stems.vocal.R[j] + stems.foley.R[j]; e += l * l + r * r; }
+      pre.push(10 * Math.log10(e / (2 * (b - a)) + 1e-12)); trim.push(db(TARGET[k] - pre[k]));
+    });
+    log('  pre-master rms: ' + pre.map(function (x) { return x.toFixed(1); }).join('  ') + '   trims dB: ' + trim.map(function (x) { return (20 * Math.log10(x)).toFixed(1); }).join('  '));
+    var ride = new Float32Array(N), XF = 2.2 * SR;
+    for (i = 0; i < N; i++) {
+      var k = 0, KL = secs.length - 1; while (k < KL && i >= secs[k][1] * SR) k++;
+      var g = trim[k], dn = secs[k][1] * SR - i, up = i - secs[k][0] * SR;
+      if (k < KL && dn < XF / 2) g = trim[k] + (trim[k + 1] - trim[k]) * (.5 - .5 * Math.cos(Math.PI * (.5 - dn / XF)));
+      else if (k > 0 && up < XF / 2) g = trim[k - 1] + (trim[k] - trim[k - 1]) * (.5 - .5 * Math.cos(Math.PI * (.5 + up / XF)));
+      ride[i] = g;
+    }
+    // natural ending: everything is silent by 149.9 s
+    var fo0 = 178.2 * SR, fo1 = 179.9 * SR;
+    ['music', 'vocal', 'foley'].forEach(function (k) { var s = stems[k]; for (i = 0; i < N; i++) { var fd = (i < fo0 ? 1 : i > fo1 ? 0 : .5 + .5 * Math.cos(Math.PI * (i - fo0) / (fo1 - fo0))) * G * ride[i]; s.L[i] *= fd; s.R[i] *= fd; L[i] += s.L[i]; R[i] += s.R[i]; } });
+    var red = limiter(L, R, db(-1.5));
+    // section loudness report
+    var stats = [];
+    secs.forEach(function (s) { var a = s[0] * SR, b = s[1] * SR, e = 0, pk = 0; for (i = a; i < b; i++) { e += L[i] * L[i] + R[i] * R[i]; var p = Math.max(Math.abs(L[i]), Math.abs(R[i])); if (p > pk) pk = p; } stats.push({ sec: s, rms: 10 * Math.log10(e / (2 * (b - a)) + 1e-12), peak: 20 * Math.log10(pk + 1e-9) }); });
+    log('gain reduction > 0.5 dB on ' + (red * 100).toFixed(2) + '% of samples, max ' + limiter.maxGR.toFixed(1) + ' dB; total ' + (Date.now() - t0) + ' ms');
+    return { sr: SR, mix: { L: L, R: R }, stems: stems, stats: stats };
+  }
+  function wav(L, R) { // 16-bit PCM with TPDF dither
+    var n = L.length, buf = Buffer.alloc(44 + n * 4), o = 44;
+    buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 4, 4); buf.write('WAVEfmt ', 8); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(2, 22);
+    buf.writeUInt32LE(SR, 24); buf.writeUInt32LE(SR * 4, 28); buf.writeUInt16LE(4, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 4, 40);
+    for (var i = 0; i < n; i++) {
+      var d = (rnd() - rnd()) / 32768, a = Math.round(clamp(L[i] + d, -1, 1) * 32767), b = Math.round(clamp(R[i] + d, -1, 1) * 32767);
+      buf.writeInt16LE(a, o); buf.writeInt16LE(b, o + 2); o += 4;
+    }
+    return buf;
+  }
+  var API = { render: render, wav: wav, SR: SR, DUR: DUR };
+  if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.SCORE = API;
+})(typeof window !== 'undefined' ? window : globalThis);
