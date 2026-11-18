@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>落花雨</title>
+<link rel="stylesheet" href="fonts/serif.css">
+<style>html,body{margin:0;height:100%;background:#05071a;display:flex;align-items:center;justify-content:center}
+canvas{width:min(100vw,177.8vh);height:auto;display:block}#go{position:fixed;inset:0;background:none;border:0;color:#f0e5cc;font:24px serif;letter-spacing:.5em;cursor:pointer}</style>
+</head><body>
+<canvas id="cv" width="1920" height="1080"></canvas>
+<button id="go">▶ 播放</button>
+<script src="src/timing.js"></script>
+<script src="src/lib.js"></script>
+<script src="src/film.js"></script>
+<script src="src/s1.js"></script>
+<script src="src/s2.js"></script>
+<script src="src/s3.js"></script>
+<script src="src/s4.js"></script>
+<script src="src/harness.js"></script>
+<script>
+if (!/harness=1/.test(location.search)) {
+  HARNESS.init(Math.min(1, innerWidth * devicePixelRatio / 1920)).then(function () {
+    var cv = document.getElementById('cv'), ctx = cv.getContext('2d'), au = new Audio('assets/song.m4a');
+    FILM.render(ctx, 0.5);
+    document.getElementById('go').onclick = function () { this.style.display = 'none'; au.currentTime = 0; au.play();
+      (function loop() { FILM.render(ctx, au.currentTime); if (!au.ended) requestAnimationFrame(loop); else document.getElementById('go').style.display = ''; })(); };
+  });
+}
+</script>
+</body></html>
