@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>薛定谔的签</title>
+<link rel="stylesheet" href="fonts/fonts.css">
+<style>html,body{margin:0;height:100%;background:#07031a;display:flex;align-items:center;justify-content:center}
+canvas{height:min(100vh,177.8vw);width:auto;display:block}#go{position:fixed;inset:0;background:none;border:0;color:#fff;font:24px sans-serif;letter-spacing:.4em;cursor:pointer}</style>
+</head><body>
+<canvas id="cv" width="1080" height="1920"></canvas>
+<button id="go">▶ 播放</button>
+<script src="src/script.js"></script>
+<script src="src/lib.js"></script>
+<script src="src/props.js"></script>
+<script src="src/film.js"></script>
+<script src="src/sc1.js"></script>
+<script src="src/sc2.js"></script>
+<script src="src/sc3.js"></script>
+<script src="src/sc4.js"></script>
+<script src="src/harness.js"></script>
+<script>
+if (!/harness=1/.test(location.search)) {
+  HARNESS.init(Math.min(1, innerHeight * devicePixelRatio / 1920)).then(function () {
+    var cv = document.getElementById('cv'), ctx = cv.getContext('2d'), au = new Audio('assets/soundtrack.m4a');
+    FILM.render(ctx, 12);
+    document.getElementById('go').onclick = function () { this.style.display = 'none'; au.currentTime = 0; au.play();
+      (function loop() { FILM.render(ctx, au.currentTime); if (!au.ended) requestAnimationFrame(loop); else document.getElementById('go').style.display = ''; })(); };
+  });
+}
+</script>
+</body></html>
